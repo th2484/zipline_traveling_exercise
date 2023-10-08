@@ -2,6 +2,7 @@
 
 import os
 from typing import Dict, List, TextIO
+import math
 
 # If you add or upgrade any pip packages, please specify in `requirements.txt`
 import yaml  # noqa
@@ -22,6 +23,8 @@ ZIP_MAX_CUMULATIVE_RANGE_M = 160 * 1000  # 160 km -> meters
 # The two acceptable priorities
 EMERGENCY = "Emergency"
 RESUPPLY = "Resupply"
+
+NEST = [0, 0]
 
 
 # You shouldn't need to modify this class
@@ -60,6 +63,11 @@ class Order:
         self.time = time
         self.hospital = hospital
         self.priority = priority
+        self.allocated = False
+        self.weighted_priority = None
+
+    def __str__(self):
+        return f"[{self.time}] {self.priority}, deliver to {self.hospital.name}"
 
     @staticmethod
     def load_from_csv(f: TextIO, hospitals: Dict[str, Hospital]) -> List["Order"]:
@@ -89,13 +97,56 @@ class Order:
 
 # Feel free to extend as needed
 class Flight:
-    def __init__(self, launch_time: int, orders: List[Order]):
+    def __init__(self, launch_time: int, orders: List[Order], distance):
         self.launch_time = launch_time
         self.orders = orders
+        self.distance = distance
 
     def __str__(self) -> str:
         orders_str = "->".join([o.hospital.name for o in self.orders])
-        return f"<Flight @ {self.launch_time} to {orders_str}>"
+        return f"<Flight @ {self.launch_time} to {orders_str} returning at {self.return_time()}>"
+
+    def return_time(self):
+        flight_time_s = round(self.distance / ZIP_SPEED_MPS)
+        return self.launch_time + flight_time_s
+
+    @staticmethod
+    def validate_flight_plan(flight_plan, order):
+        flight_plan_distance = 0
+
+        if flight_plan:
+            for index, loaded_order in enumerate(flight_plan):
+                if not flight_plan_distance:
+                    hospital = [loaded_order.hospital.north_m, loaded_order.hospital.east_m]
+                    distance = math.dist(NEST, hospital)
+                    distance_round_trip = distance*2
+                    flight_plan_distance += distance_round_trip
+                else:
+                    previous_stop = [flight_plan[index-1].hospital.north_m, flight_plan[index-1].hospital.east_m]
+                    next_hospital = [loaded_order.hospital.north_m, loaded_order.hospital.east_m]
+                    distance = math.dist(previous_stop, next_hospital)
+                    distance_round_trip = distance * 2
+                    flight_plan_distance += distance_round_trip
+            print(f"Allocated travel range: {flight_plan_distance} meters/ {ZIP_MAX_CUMULATIVE_RANGE_M} meters")
+
+        if flight_plan_distance < ZIP_MAX_CUMULATIVE_RANGE_M:
+            print("Check if we can add the next order")
+            last_stop = [flight_plan[-1].hospital.north_m, flight_plan[-1].hospital.east_m] if flight_plan else NEST
+            new_stop = [order.hospital.north_m, order.hospital.east_m]
+            distance = math.dist(last_stop, new_stop)
+            distance_round_trip = distance * 2
+            tentative_new_distance = flight_plan_distance + distance_round_trip
+
+            if tentative_new_distance <= ZIP_MAX_CUMULATIVE_RANGE_M:
+                flight_plan_distance += distance_round_trip
+                print("Order added!")
+                print(f"New allocated travel range: {flight_plan_distance} meters/ {ZIP_MAX_CUMULATIVE_RANGE_M} meters")
+                return True, flight_plan_distance
+            else:
+                print("Could not add order - distance out of range!")
+                print(
+                    f"Out of Range: {tentative_new_distance} meters/ {ZIP_MAX_CUMULATIVE_RANGE_M} meters")
+                return False, tentative_new_distance
 
 
 class ZipScheduler:
@@ -115,6 +166,7 @@ class ZipScheduler:
 
         # Track which orders haven't been launched yet
         self._unfulfilled_orders: List[Order] = []
+        self._launched_flights: List[Flight] = []
 
     @property
     def unfulfilled_orders(self) -> List[Order]:
@@ -129,11 +181,13 @@ class ZipScheduler:
         Args:
             order (Order): the order just placed.
         """
-
+        print(self._unfulfilled_orders)
+        if order.priority == EMERGENCY:
+            order.weighted_priority = 5
+        else:
+            order.weighted_priority = 1
         self.unfulfilled_orders.append(order)
-
-        # TODO: implement me!
-        pass
+        print(len(self._unfulfilled_orders))
 
     def launch_flights(self, current_time: int) -> List[Flight]:
         """Determines which flights should be launched right now.
@@ -149,9 +203,63 @@ class ZipScheduler:
             list: Flight objects that launch at this time.
         """
 
-        # TODO: implement me!
-        # You should remove any orders from `self.unfilfilled_orders` as you go
-        return []
+        self.track_flights(current_time)
+        if not self._unfulfilled_orders:
+            return
+
+        available_zips = self.num_zips - len(self._launched_flights)
+        print(f"There are {available_zips} zips available.")
+        sorted_orders = sorted(self._unfulfilled_orders, key=lambda order_item: (order_item.weighted_priority, order_item.time))
+        loaded_zips = []
+
+        for _i in range(available_zips):
+            flight_plan = []
+            flight_plan_distance = 0
+
+            remaining_orders = [item for item in sorted_orders if item.allocated is not True]
+
+            # all orders fulfilled
+            if not remaining_orders:
+                continue
+
+            # still work left to ship out
+            for order in remaining_orders:
+                # if not flight_plan:
+                #     order.allocated = True
+                #     is_valid, distance = Flight.validate_flight_plan(flight_plan, order)
+                #     flight_plan.append(order)
+                #     print(f"Added first order to flight plan: {flight_plan}")
+                if len(flight_plan) < 3:
+                    is_valid, distance = Flight.validate_flight_plan(flight_plan, order)
+                    if is_valid:
+                        order.allocated = True
+                        flight_plan.append(order)
+                        flight_plan_distance = distance
+                        print(f"Added order to flight plan: {flight_plan}")
+
+            if flight_plan:
+                loaded_zip = Flight(current_time, flight_plan, flight_plan_distance)
+                loaded_zips.append(loaded_zip)
+                print(f"Flight loaded: {loaded_zip}")
+
+                # You should remove any orders from `self.unfilfilled_orders` as you go
+                for loaded_order in flight_plan:
+                    order_index = self._unfulfilled_orders.index(loaded_order)
+                    self._unfulfilled_orders.pop(order_index)
+
+        print("All zips packed!")
+        self._launched_flights.extend(loaded_zips)
+        self.track_flights(current_time)
+
+        return loaded_zips
+
+    def track_flights(self, seconds_since_midnight):
+        for index, flight in enumerate(self._launched_flights):
+            if seconds_since_midnight > flight.return_time():
+                self._launched_flights.pop(index)
+                print(f"{flight.__str__()} has returned!")
+        # print(f"There are currently {len(self._launched_flights) if len(self._launched_flights) else 'no'} launched flights. ")
+
 
 
 class Runner:
