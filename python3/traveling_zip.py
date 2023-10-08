@@ -26,6 +26,22 @@ RESUPPLY = "Resupply"
 
 NEST = [0, 0]
 
+# controls for order throttling to prioritize Emergency zips
+MIN_RESUPPLY_ORDERS_NEEDED_TO_LOAD = 2
+MIN_ZIPS_TO_SHIP_SINGLE_ORDERS = 6
+
+# flight and order stats
+EMERGENCY_ORDER_WAIT_TIME = []
+RESUPPLY_ORDER_WAIT_TIME = []
+ORDER_WAIT_TIME = []
+
+FLIGHT_PLAN_ORDERS = []
+FLIGHT_PLAN_DISTANCE = []
+
+# assuming launch_flights is called once per minute
+NUM_MINS_WITH_0_ZIPS_AVAILABLE = []
+NUM_MINS_WITH_0_ZIPS_AVAILABLE_AND_EMERGENCY_ORDER = []
+
 
 # You shouldn't need to modify this class
 class Hospital:
@@ -66,7 +82,7 @@ class Order:
         self.allocated = False
         self.weighted_priority = None
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"[{self.time}] {self.priority}, deliver to {self.hospital.name}"
 
     @staticmethod
@@ -181,13 +197,11 @@ class ZipScheduler:
         Args:
             order (Order): the order just placed.
         """
-        print(self._unfulfilled_orders)
         if order.priority == EMERGENCY:
             order.weighted_priority = 5
         else:
             order.weighted_priority = 1
         self.unfulfilled_orders.append(order)
-        print(len(self._unfulfilled_orders))
 
     def launch_flights(self, current_time: int) -> List[Flight]:
         """Determines which flights should be launched right now.
@@ -203,16 +217,35 @@ class ZipScheduler:
             list: Flight objects that launch at this time.
         """
 
-        self.track_flights(current_time)
+        # if no orders are queued, there is nothing to do
         if not self._unfulfilled_orders:
             return
 
+        # if we have orders that need to go out, check for any returned zips that we can reuse
+        self.track_flights(current_time)
+
+        sorted_orders = sorted(self._unfulfilled_orders, key=lambda order_item: (-order_item.weighted_priority, order_item.time))
+
+        # currently unfulfilled orders, sorted by priority then time received
+        print(f"There are {len(sorted_orders)} unfulfilled orders.")
+        for index, order in enumerate(sorted_orders):
+            print(f"Order priority # {index + 1}: {order}, priority: {order.priority}")
+
         available_zips = self.num_zips - len(self._launched_flights)
-        print(f"There are {available_zips} zips available.")
-        sorted_orders = sorted(self._unfulfilled_orders, key=lambda order_item: (order_item.weighted_priority, order_item.time))
+        if available_zips:
+            zips_quant = "is 1 zip" if available_zips == 1 else f"are {available_zips}"
+            print(f"There { zips_quant } available.\n")
+        else:
+            print("No zips available, cannot load.\n\n")
+            NUM_MINS_WITH_0_ZIPS_AVAILABLE.append(1)
+            if sorted_orders[0].priority == EMERGENCY:
+                NUM_MINS_WITH_0_ZIPS_AVAILABLE_AND_EMERGENCY_ORDER.append(1)
+            return
+
         loaded_zips = []
 
-        for _i in range(available_zips):
+        # iterate through the number of available zips to plan flight paths/allocate orders
+        for available_zip in range(available_zips):
             flight_plan = []
             flight_plan_distance = 0
 
@@ -222,14 +255,22 @@ class ZipScheduler:
             if not remaining_orders:
                 continue
 
-            # still work left to ship out
+            not_many_remaining_orders = len(remaining_orders) < MIN_RESUPPLY_ORDERS_NEEDED_TO_LOAD
+            no_emergency_orders = remaining_orders[0].priority == RESUPPLY
+            not_many_zips_available = available_zips < MIN_ZIPS_TO_SHIP_SINGLE_ORDERS
+
+            # this check reduces wait time for Emergency zips
+            if not_many_remaining_orders and no_emergency_orders and not_many_zips_available:
+                # We can probably deliver at least 2 non-priority orders at a time,
+                # so we can hold off on sending a single order in order to reserve zips for
+                # emergency orders
+                print("No emergency orders in queue and mins to ship non-priority orders not met."
+                      + "Waiting to collect more orders.")
+                continue
+
+            # still orders left to ship out
             for order in remaining_orders:
-                # if not flight_plan:
-                #     order.allocated = True
-                #     is_valid, distance = Flight.validate_flight_plan(flight_plan, order)
-                #     flight_plan.append(order)
-                #     print(f"Added first order to flight plan: {flight_plan}")
-                if len(flight_plan) < 3:
+                if len(flight_plan) < MAX_PACKAGES_PER_ZIP:
                     is_valid, distance = Flight.validate_flight_plan(flight_plan, order)
                     if is_valid:
                         order.allocated = True
@@ -242,24 +283,34 @@ class ZipScheduler:
                 loaded_zips.append(loaded_zip)
                 print(f"Flight loaded: {loaded_zip}")
 
-                # You should remove any orders from `self.unfilfilled_orders` as you go
                 for loaded_order in flight_plan:
+                    order_wait_time = current_time - loaded_order.time
+
+                    # gather stats on the average amount of time an order waited to get loaded
+                    if loaded_order.priority == EMERGENCY:
+                        EMERGENCY_ORDER_WAIT_TIME.append(order_wait_time)
+                    if loaded_order.priority == RESUPPLY:
+                        RESUPPLY_ORDER_WAIT_TIME.append(order_wait_time)
+                    ORDER_WAIT_TIME.append(order_wait_time)
+
+                    # You should remove any orders from `self.unfilfilled_orders` as you go
                     order_index = self._unfulfilled_orders.index(loaded_order)
                     self._unfulfilled_orders.pop(order_index)
 
+        for flight in loaded_zips:
+            # gather flight plan stats
+            FLIGHT_PLAN_ORDERS.append(len(flight.orders))
+            FLIGHT_PLAN_DISTANCE.append(flight.distance)
+
         print("All zips packed!")
         self._launched_flights.extend(loaded_zips)
-        self.track_flights(current_time)
-
         return loaded_zips
 
     def track_flights(self, seconds_since_midnight):
         for index, flight in enumerate(self._launched_flights):
             if seconds_since_midnight > flight.return_time():
                 self._launched_flights.pop(index)
-                print(f"{flight.__str__()} has returned!")
-        # print(f"There are currently {len(self._launched_flights) if len(self._launched_flights) else 'no'} launched flights. ")
-
+                print(f"{flight} has returned!")
 
 
 class Runner:
@@ -281,6 +332,50 @@ class Runner:
             zip_speed_mps=ZIP_SPEED_MPS,
             zip_max_cumulative_range_m=ZIP_MAX_CUMULATIVE_RANGE_M,
         )
+        self.daily_flights_counter = 0
+
+    def gather_stats(self) -> None:
+        """
+        Print out daily stats about FLIGHTS and ORDERS at the end of the day.
+        """
+        print("\n____________________DAILY STATS____________________\n")
+        # These orders were not launched by midnight
+        print("ORDER STATS\n")
+        print(
+            f"{len(self.scheduler.unfulfilled_orders)} unfulfilled orders at" +
+            " the end of the day"
+        )
+        avg_order_wait_time = round(sum(ORDER_WAIT_TIME) / len(ORDER_WAIT_TIME))
+        avg_resupply_order_wait_time = round(sum(RESUPPLY_ORDER_WAIT_TIME) / len(RESUPPLY_ORDER_WAIT_TIME))
+        avg_emergency_order_wait_time = round(sum(EMERGENCY_ORDER_WAIT_TIME) / len(EMERGENCY_ORDER_WAIT_TIME))
+
+        print(
+            f"The average Emergency order wait time was: {avg_emergency_order_wait_time}" +
+            f" seconds for {len(EMERGENCY_ORDER_WAIT_TIME)} Emergency orders served.")
+
+        print(
+            f"The average Re-Supply wait time was: {avg_resupply_order_wait_time}" +
+            f" seconds for {len(RESUPPLY_ORDER_WAIT_TIME)} Re-Supply orders served.")
+
+        print(
+            f"The average order (Emergency or Re-Supply) wait time was: {avg_order_wait_time}" +
+            f" seconds for for {len(ORDER_WAIT_TIME)} total orders served.''')")
+
+        print("\nFLIGHT STATS\n")
+        avg_packages_per_flight = round(sum(FLIGHT_PLAN_ORDERS) / len(FLIGHT_PLAN_ORDERS), 2)
+        avg_distance_per_flight = round(sum(FLIGHT_PLAN_DISTANCE) / len(FLIGHT_PLAN_DISTANCE))
+        percent_max_flight_range_used = round((avg_distance_per_flight / ZIP_MAX_CUMULATIVE_RANGE_M) * 100)
+
+        print(f"{self.daily_flights_counter} flights went out today.")
+        print(f"Flights carried an average of {avg_packages_per_flight} packages and flew and average" +
+              f" of {avg_distance_per_flight} meters (max range: {ZIP_MAX_CUMULATIVE_RANGE_M}), using and average " +
+              f" {percent_max_flight_range_used}% of the max range.")
+        print(
+            f"There were {len(NUM_MINS_WITH_0_ZIPS_AVAILABLE_AND_EMERGENCY_ORDER)} minutes with 0 zips " +
+            " available and an Emergency package in the queue.")
+        print(
+            f"There were {len(NUM_MINS_WITH_0_ZIPS_AVAILABLE)} minutes with 0 zips available and any package" +
+            " in the queue.")
 
     def run(self) -> None:
         """Run the simulator.
@@ -303,11 +398,9 @@ class Runner:
                 # Once a minute, poke the flight launcher
                 self.__update_launch_flights(sec_since_midnight)
 
-        # These orders were not launched by midnight
-        print(
-            f"{len(self.scheduler.unfulfilled_orders)} unfulfilled orders at"
-            + "the end of the day"
-        )
+        self.gather_stats()
+
+
 
     def __queue_pending_orders(self, sec_since_midnight: int) -> None:
         """Grab an order from the queue and queue it.
@@ -336,6 +429,7 @@ class Runner:
             print(f"[{sec_since_midnight}] Scheduling flights:")
             for f in flights:
                 print(f)
+                self.daily_flights_counter += 1
 
 
 """
