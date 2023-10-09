@@ -79,7 +79,10 @@ class Order:
         self.time = time
         self.hospital = hospital
         self.priority = priority
+        # marking an order as allocated in order to exclude it
+        # from other zips that are being packed before it ships
         self.allocated = False
+        # numeric priority in order to make sorting easier
         self.weighted_priority = None
 
     def __str__(self) -> str:
@@ -143,6 +146,7 @@ class Flight:
         """
         flight_segment_distances = []
 
+        # parse the start and end coordinates for each stop in order to calculate distance
         stop_coordinates = [
             {"north_m": order.hospital.north_m, "east_m": order.hospital.east_m}
             for order in flight_plan
@@ -151,6 +155,8 @@ class Flight:
         # add the Nest as the last stop to account for mileage to return home
         stop_coordinates.append({"north_m": NEST[0], "east_m": NEST[1]})
 
+        # using the coordinates of the previous stop as the starting point and
+        # the coordinates of the current stop as the ending point, calculate the distance of the segment
         for index, stop in enumerate(stop_coordinates):
             start_coordinates = (
                 [
@@ -165,8 +171,10 @@ class Flight:
             segment_distance = math.dist(start_coordinates, dest_hospital)
 
             # get the absolute distance of start to end point for the stop
-            flight_segment_distances.append(abs(segment_distance))
+            absolute_distance = abs(segment_distance)
+            flight_segment_distances.append(absolute_distance)
 
+        # the sum of the segment distances, beginning at and returning to the Nest, is the total distance flown
         flight_path_distance = sum(flight_segment_distances)
         return flight_path_distance
 
@@ -180,7 +188,7 @@ class Flight:
             flight_plan (List[Orders]): List of Orders currently in the flight plan, already validated.
             order (Order): Order to validate as the next stop in flight plan.
         Returns:
-            bool: Whether the flight plan is valid with the passed in proposed next stop.
+            bool: Whether the flight plan is valid with the passed in proposed next stop included.
         """
         print(
             f"Checking if order [{order.time}] {order.hospital.name}--{order.priority} can be added to flight path."
@@ -218,6 +226,7 @@ class ZipScheduler:
         self.max_packages_per_zip = max_packages_per_zip
         self.zip_speed_mps = zip_speed_mps
         self.zip_max_cumulative_range_m = zip_max_cumulative_range_m
+        # Flights that have not yet returned/are unavailable
         self._launched_flights: List[Flight] = []
         # Track which orders haven't been launched yet
         self._unfulfilled_orders: List[Order] = []
@@ -235,6 +244,7 @@ class ZipScheduler:
         Args:
             order (Order): the order just placed.
         """
+        # added numeric weights for easier sorting
         if order.priority == EMERGENCY:
             order.weighted_priority = 5
         else:
@@ -263,17 +273,19 @@ class ZipScheduler:
         self.track_flights(current_time)
 
         # sort orders first by priority, then by time they were received
+        # TODO: Other sort/route optimizations are possible, such as grouping nearby or same destinations
+        #  in order to reduce flight time, etc
         sorted_orders = sorted(
             self._unfulfilled_orders,
             key=lambda order_item: (-order_item.weighted_priority, order_item.time),
         )
 
-        # logger to show the sorted orders in the console in absence of a UI
         orders_quant = (
             "is 1 unfulfilled order"
             if len(sorted_orders) == 1
             else f"are {len(sorted_orders)} unfulfilled orders"
         )
+        # logger to show the sorted orders in the console in absence of a UI
         print(f"There {orders_quant}.")
         for index, order in enumerate(sorted_orders):
             print(f"Order priority # {index + 1}: {order}, priority: {order.priority}")
@@ -297,6 +309,7 @@ class ZipScheduler:
         for available_zip in range(available_zips):
             flight_plan = []
 
+            # check for orders that have not already been assigned to a zip
             remaining_orders = [
                 item for item in sorted_orders if item.allocated is not True
             ]
@@ -305,6 +318,8 @@ class ZipScheduler:
             if not remaining_orders:
                 continue
 
+            # these configurable settings are meant to group non-emergency orders together/
+            # allowing them to wait in the queue if there are not enough to fill up a zip
             not_many_remaining_orders = (
                 len(remaining_orders) < MIN_RESUPPLY_ORDERS_NEEDED_TO_LOAD
             )
@@ -326,17 +341,24 @@ class ZipScheduler:
                 )
                 continue
 
-            # still orders left to ship out
+            # there are still orders left to ship out
             for order in remaining_orders:
                 if len(flight_plan) < MAX_PACKAGES_PER_ZIP:
+                    # validate that the order can be added to the zip flight plan without
+                    # surpassing the zip's max range
                     is_valid = Flight.validate_flight_plan(flight_plan.copy(), order)
                     if is_valid:
+                        # if the order can be added, add it and mark it as allocated
                         order.allocated = True
                         flight_plan.append(order)
-                        print(
-                            f"There are currently {len(flight_plan)} orders in this flight plan."
+                        quant_orders = (
+                            "is currently 1 order"
+                            if len(flight_plan) == 1
+                            else f"are currently {len(flight_plan)} orders"
                         )
+                        print(f"There {quant_orders} in this flight plan.")
 
+            # if the zip has orders in its flight path, it should be launched
             if flight_plan:
                 # a loaded zip represents a flight that is ready to launch with a finalized flight path
                 loaded_zip = Flight(current_time, flight_plan)
@@ -344,9 +366,8 @@ class ZipScheduler:
                 print(f"Flight loaded: {loaded_zip}")
 
                 for loaded_order in flight_plan:
-                    order_wait_time = current_time - loaded_order.time
-
                     # gather stats on the average amount of time an order waited to get loaded
+                    order_wait_time = current_time - loaded_order.time
                     if loaded_order.priority == EMERGENCY:
                         EMERGENCY_ORDER_WAIT_TIME.append(order_wait_time)
                     if loaded_order.priority == RESUPPLY:
@@ -362,13 +383,21 @@ class ZipScheduler:
             FLIGHT_PLAN_ORDERS.append(len(flight.orders))
             FLIGHT_PLAN_DISTANCE.append(flight.distance)
 
-        print("All zips packed!")
+        print("Zips packed!")
         self._launched_flights.extend(loaded_zips)
         return loaded_zips
 
-    def track_flights(self, seconds_since_midnight):
+    def track_flights(self, seconds_since_midnight) -> None:
+        """
+        Track how many zips are in flight/ how many have returned.
+        This tracking functionality allows us to know how many zips are currently available.
+
+        Args:
+            seconds_since_midnight(int): In lieu of current time for the purpose of the exercise
+        """
         for index, flight in enumerate(self._launched_flights):
             if seconds_since_midnight > flight.get_return_time():
+                # Remove returned zips from launched/unavailable zips list
                 self._launched_flights.pop(index)
                 print(f"{flight} has returned!")
 
